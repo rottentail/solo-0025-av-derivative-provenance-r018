@@ -104,6 +104,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                     request_id=request_id,
                 )
                 return
+            if path == "/v1/metrics":
+                write_json(
+                    self,
+                    200,
+                    self.application.metrics_snapshot(),
+                    request_id=request_id,
+                )
+                return
             asset_match = ASSET_PATH.match(path)
             if asset_match:
                 write_json(

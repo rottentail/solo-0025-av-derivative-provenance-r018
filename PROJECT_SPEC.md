@@ -235,6 +235,7 @@ outcomes without knowing HTTP details.
 ## Public HTTP interface
 
 - `GET /health`
+- `GET /v1/metrics`
 - `POST /v1/assets`
 - `GET /v1/assets/{asset_id}`
 - `POST /v1/renditions`
@@ -267,11 +268,33 @@ python3 -m compileall -q avprovenance scripts
 python3 scripts/workflow_checks.py ingest-media-asset
 python3 scripts/workflow_checks.py execute-rendition
 python3 scripts/workflow_checks.py verify-reproduction
+python3 scripts/workflow_checks.py shared-stage-reuse
 ```
 
 The checks start an ephemeral HTTP server, generate bounded media bytes in
 memory, call the public endpoints, and assert observable state. They do not
 require network access or external media programs.
+
+## Shared stage computation
+
+Multiple renditions often share an identical prefix of operations on the same
+source and differ only in their tail. The media layer records each prefix
+result as an immutable, content-addressed *stage* and reuses it instead of
+recomputing the same samples or pixels. A stage key contains the primary
+source digest, the secondary source digest after a mix, and the complete
+normalized operation prefix including every parameter, so reuse happens only
+when every rounding, clipping, and normalization step is identical. A
+secondary mix with different parameters or a different secondary asset cannot
+borrow another mix's stage.
+
+The production pipeline uses one process-wide stage cache. Integrity checks
+use a separate cache scoped to a round of concurrent checks and keyed only by
+the digests of source bytes read in that round; verification never reads the
+production cache or a stored output as proof, and the round cache is discarded
+when the round ends. Stages become visible only after a computation fully
+succeeds, failures are evicted, and per-key locks keep distinct stages running
+in parallel. `GET /v1/metrics` reports computed, reused, and failed stage
+counts and timings so the savings are observable rather than assumed.
 
 ## Intentionally omitted capabilities
 

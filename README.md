@@ -119,6 +119,43 @@ The successful response has `status: "verified"`. A byte or descriptor
 difference returns HTTP `409` with code `INTEGRITY_MISMATCH`; the mismatch
 record remains durable.
 
+### Read execution metrics
+
+```http
+GET /v1/metrics
+```
+
+Returns per-scope stage counters (`computed`, `reused`, `failed`, lookups,
+wall time, and a per-stage breakdown) for production rendering and any active
+verification round. These counters make the avoided recomputation observable.
+
+## Shared media stages
+
+Renditions that apply the same normalized operations to the same source bytes
+share intermediate media stages instead of recomputing them. A stage key
+includes the primary source digest, the secondary source digest once a mix has
+occurred, and every normalized operation in the applied prefix (with all
+numeric parameters). Two plans therefore reuse a stage only when their inputs
+and the exact rounding, clipping, gain, crop, or normalization steps match. A
+different secondary mix can never reuse another mix's stage even when the
+primary asset and the operation names are identical.
+
+Two isolated caches enforce the provenance boundary:
+
+- **Production cache** — a process-wide, content-addressed cache for
+  `POST /v1/renditions`. Distinct endings of a shared prefix reuse the common
+  stages and only compute the tail.
+- **Verification rounds** — integrity checks never read the production cache
+  or any stored output as proof. Checks that run concurrently form one round
+  with a fresh, empty cache keyed only by the digests of the source bytes read
+  in that round. When the last concurrent check finishes, the round and its
+  stages are discarded, so the next round recomputes from source.
+
+Stage results are published only after a computation fully completes; a failed
+computation is evicted, so concurrent requests never observe a half-written
+stage. Per-key locks coordinate identical stages while distinct stages continue
+to run in parallel rather than serializing all rendering.
+
 ## Media operation examples
 
 Audio mixing plan:
@@ -196,10 +233,14 @@ current production workflow checks are:
 python3 scripts/workflow_checks.py ingest-media-asset
 python3 scripts/workflow_checks.py execute-rendition
 python3 scripts/workflow_checks.py verify-reproduction
+python3 scripts/workflow_checks.py shared-stage-reuse
 ```
 
 Each check starts a temporary HTTP server, generates media bytes in memory,
-exercises the public endpoints, and shuts the server down.
+exercises the public endpoints, and shuts the server down. The
+`shared-stage-reuse` check also drives parallel requests and reads
+`/v1/metrics` to assert that shared stages are reused while distinct mixes and
+verification rounds stay isolated.
 
 ## Environment
 

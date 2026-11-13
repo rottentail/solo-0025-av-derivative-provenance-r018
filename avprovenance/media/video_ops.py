@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..serialization import sha256_hex
 from .errors import MediaOperationFailure
+from .stage_cache import StageCache
+from .stage_keys import decode_key, stage_key
 from .y4m import Y4mClip, Y4mFrame, decode_y4m, encode_y4m
 
 
@@ -170,36 +173,82 @@ def mirror_video(clip: Y4mClip, operation: dict[str, Any]) -> Y4mClip:
     )
 
 
-def render_video(
-    primary_bytes: bytes,
-    operations: list[dict[str, Any]],
-    secondary_bytes: bytes | None,
-) -> bytes:
-    if secondary_bytes is not None:
-        raise MediaOperationFailure(
-            "VIDEO_SECONDARY_UNSUPPORTED",
-            "The current video operation set accepts one source.",
-        )
-    clip = decode_y4m(primary_bytes)
+def _apply_video_operation(
+    clip: Y4mClip,
+    operation: dict[str, Any],
+) -> Y4mClip:
     try:
-        for operation in operations:
-            operation_type = operation["type"]
-            if operation_type == "media_trim":
-                clip = trim_video(clip, operation)
-            elif operation_type == "video_crop":
-                clip = crop_video(clip, operation)
-            elif operation_type == "video_luma_offset":
-                clip = offset_luma(clip, operation)
-            elif operation_type == "video_mirror":
-                clip = mirror_video(clip, operation)
-            else:
-                raise MediaOperationFailure(
-                    "UNSUPPORTED_VIDEO_OPERATION",
-                    f"Unsupported video operation: {operation_type}",
-                )
+        operation_type = operation["type"]
+        if operation_type == "media_trim":
+            return trim_video(clip, operation)
+        if operation_type == "video_crop":
+            return crop_video(clip, operation)
+        if operation_type == "video_luma_offset":
+            return offset_luma(clip, operation)
+        if operation_type == "video_mirror":
+            return mirror_video(clip, operation)
+        raise MediaOperationFailure(
+            "UNSUPPORTED_VIDEO_OPERATION",
+            f"Unsupported video operation: {operation_type}",
+        )
     except (KeyError, TypeError, ValueError) as exc:
         raise MediaOperationFailure(
             "VIDEO_OPERATION_INVALID",
             "The video operation payload is malformed.",
         ) from exc
+
+
+def render_video_staged(
+    primary_bytes: bytes,
+    operations: list[dict[str, Any]],
+    secondary_bytes: bytes | None,
+    *,
+    primary_digest: str,
+    cache: StageCache,
+) -> bytes:
+    """Render while reusing every shared, fully computed intermediate stage."""
+    if secondary_bytes is not None:
+        raise MediaOperationFailure(
+            "VIDEO_SECONDARY_UNSUPPORTED",
+            "The current video operation set accepts one source.",
+        )
+
+    clip = cache.get_or_compute(
+        decode_key(role="primary", source_digest=primary_digest),
+        "decode_primary",
+        lambda: decode_y4m(primary_bytes),
+    )
+
+    for index, operation in enumerate(operations):
+        prefix = operations[: index + 1]
+        key = stage_key(
+            stage="video",
+            primary_digest=primary_digest,
+            secondary_digest=None,
+            operations_prefix=prefix,
+        )
+        current_clip = clip
+        clip = cache.get_or_compute(
+            key,
+            f"video:{operation['type']}",
+            lambda: _apply_video_operation(current_clip, operation),
+        )
+
     return encode_y4m(clip)
+
+
+def render_video(
+    primary_bytes: bytes,
+    operations: list[dict[str, Any]],
+    secondary_bytes: bytes | None,
+) -> bytes:
+    """Backward-compatible entry point using a private, request-local cache."""
+    cache = StageCache(scope="standalone-video")
+    primary_digest = sha256_hex(primary_bytes)
+    return render_video_staged(
+        primary_bytes,
+        operations,
+        secondary_bytes,
+        primary_digest=primary_digest,
+        cache=cache,
+    )

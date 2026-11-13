@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..errors import RenderFailed, UnsupportedMedia
-from ..media import MediaOperationFailure, apply_media_operations
+from ..media import MediaOperationFailure, StageCache, apply_media_operations
 from ..models import MediaAsset
 from ..serialization import sha256_hex
 
@@ -28,6 +28,7 @@ def reproduce_output(
     primary_bytes: bytes,
     operations: list[dict[str, Any]],
     secondary_bytes: bytes | None,
+    cache: StageCache | None = None,
 ) -> VerificationOutcome:
     expected_descriptor = output_asset.descriptor.to_dict()
     expected_digest = output_asset.sha256
@@ -42,11 +43,21 @@ def reproduce_output(
             reason="recorded_output_digest_drift",
         )
 
+    # Cache keys are derived from the digests of the source bytes read in this
+    # round, never from the recorded output, so verification proof always
+    # originates from the current source media rather than a stored product.
+    primary_digest = sha256_hex(primary_bytes)
+    secondary_digest = (
+        sha256_hex(secondary_bytes) if secondary_bytes is not None else None
+    )
     try:
         outcome = apply_media_operations(
             primary_bytes,
             operations,
             secondary_bytes,
+            cache=cache,
+            primary_digest=primary_digest,
+            secondary_digest=secondary_digest,
         )
     except (MediaOperationFailure, UnsupportedMedia, RenderFailed) as exc:
         reason = getattr(exc, "code", "reproduction_failed")

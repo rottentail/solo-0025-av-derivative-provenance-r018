@@ -7,10 +7,12 @@ from typing import Any
 
 from ..errors import UnsupportedMedia
 from ..models import MediaDescriptor
-from .audio_ops import render_audio
+from ..serialization import sha256_hex
+from .audio_ops import render_audio_staged
 from .errors import MediaOperationFailure
 from .inspector import inspect_media
-from .video_ops import render_video
+from .stage_cache import StageCache
+from .video_ops import render_video_staged
 
 
 @dataclass(frozen=True)
@@ -24,7 +26,18 @@ def apply_media_operations(
     primary_bytes: bytes,
     operations: list[dict[str, Any]],
     secondary_bytes: bytes | None,
+    *,
+    cache: StageCache | None = None,
+    primary_digest: str | None = None,
+    secondary_digest: str | None = None,
 ) -> RenderOutcome:
+    if cache is None:
+        cache = StageCache(scope="standalone-pipeline")
+    if primary_digest is None:
+        primary_digest = sha256_hex(primary_bytes)
+    if secondary_bytes is not None and secondary_digest is None:
+        secondary_digest = sha256_hex(secondary_bytes)
+
     primary = inspect_media(primary_bytes)
     if secondary_bytes is not None:
         secondary = inspect_media(secondary_bytes)
@@ -35,9 +48,22 @@ def apply_media_operations(
             )
 
     if primary.kind == "audio":
-        output = render_audio(primary_bytes, operations, secondary_bytes)
+        output = render_audio_staged(
+            primary_bytes,
+            operations,
+            secondary_bytes,
+            primary_digest=primary_digest,
+            secondary_digest=secondary_digest,
+            cache=cache,
+        )
     elif primary.kind == "video":
-        output = render_video(primary_bytes, operations, secondary_bytes)
+        output = render_video_staged(
+            primary_bytes,
+            operations,
+            secondary_bytes,
+            primary_digest=primary_digest,
+            cache=cache,
+        )
     else:
         raise UnsupportedMedia("The primary media kind has no renderer.")
 

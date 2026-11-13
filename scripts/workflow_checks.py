@@ -393,6 +393,168 @@ def run_verify_reproduction(
     }
 
 
+def run_shared_stage_reuse(
+    client: HTTPClient,
+    server: ProvenanceHTTPServer,
+) -> dict[str, Any]:
+    # Two video renditions that share an identical trim+crop prefix and only
+    # differ in their tail operation.
+    source = make_y4m(width=96, height=54, frame_count=9)
+    asset = client.upload("shared-source.y4m", source)
+
+    prefix = [
+        {"type": "media_trim", "start_frame": 1, "frame_count": 6},
+        {"type": "video_crop", "x": 4, "y": 4, "width": 64, "height": 32},
+    ]
+    ending_a = [{"type": "video_luma_offset", "amount": 10}]
+    ending_b = [{"type": "video_mirror"}]
+
+    rendition_a = client.create_rendition(
+        {
+            "primary_asset_id": asset["id"],
+            "output_name": "tail-a.y4m",
+            "operations": prefix + ending_a,
+        }
+    )
+    rendition_b = client.create_rendition(
+        {
+            "primary_asset_id": asset["id"],
+            "output_name": "tail-b.y4m",
+            "operations": prefix + ending_b,
+        }
+    )
+    require_equal(rendition_a["status"], "completed", "tail A status")
+    require_equal(rendition_b["status"], "completed", "tail B status")
+    require(
+        rendition_a["output_asset"]["sha256"]
+        != rendition_b["output_asset"]["sha256"],
+        "different endings must produce different outputs",
+    )
+
+    production = server.application.metrics_snapshot()["production"]
+    require(
+        production["reused"] > 0,
+        "the second rendition must reuse shared production stages",
+    )
+    require(
+        production["computed"] > 0 and production["failed"] == 0,
+        "production must record real computations and no failures",
+    )
+
+    # A different secondary mix can never borrow another mix's voice even with
+    # the same primary and the same operation name.
+    primary_audio = make_wav(frequency=440, amplitude=10000)
+    secondary_one = make_wav(frequency=220, amplitude=7000)
+    secondary_two = make_wav(frequency=330, amplitude=7000)
+    pa = client.upload("mix-primary.wav", primary_audio)
+    s1 = client.upload("mix-secondary-1.wav", secondary_one)
+    s2 = client.upload("mix-secondary-2.wav", secondary_two)
+    mix_plan = [
+        {"type": "media_trim", "start_seconds": 0.05, "duration_seconds": 0.3},
+        {
+            "type": "audio_mix",
+            "secondary_gain": -6,
+            "primary_weight": 0.75,
+            "secondary_weight": 0.4,
+        },
+        {"type": "audio_normalize", "target_peak": 0.8},
+    ]
+    mix_one = client.create_rendition(
+        {
+            "primary_asset_id": pa["id"],
+            "secondary_asset_id": s1["id"],
+            "output_name": "mix-1.wav",
+            "operations": mix_plan,
+        }
+    )
+    mix_two = client.create_rendition(
+        {
+            "primary_asset_id": pa["id"],
+            "secondary_asset_id": s2["id"],
+            "output_name": "mix-2.wav",
+            "operations": mix_plan,
+        }
+    )
+    require(
+        mix_one["output_asset"]["sha256"]
+        != mix_two["output_asset"]["sha256"],
+        "distinct secondary mixes must not share an output",
+    )
+
+    # Concurrent integrity checks in one round share recomputation, yet each
+    # derives its own result from the freshly read sources.
+    barrier = threading.Barrier(3)
+    results: dict[int, tuple[int, dict[str, Any]]] = {}
+
+    def verify(index: int, rendition_id: str) -> None:
+        barrier.wait()
+        results[index] = client.request(
+            "POST",
+            f"/v1/renditions/{rendition_id}/integrity-checks",
+            {},
+        )
+
+    threads = [
+        threading.Thread(
+            target=verify, args=(0, rendition_a["id"])
+        ),
+        threading.Thread(
+            target=verify, args=(1, rendition_b["id"])
+        ),
+        threading.Thread(
+            target=verify, args=(2, rendition_a["id"])
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    require_equal(len(results), 3, "all parallel checks returned")
+    for index, (status, body) in sorted(results.items()):
+        require_equal(status, 201, f"parallel check {index} status")
+        require_equal(body["status"], "verified", f"parallel check {index} result")
+
+    snapshot = server.application.metrics_snapshot()
+    # The round tears down once every concurrent check completes.
+    require_equal(
+        snapshot["active_verification_rounds"],
+        [],
+        "verification round caches are discarded after the round",
+    )
+
+    # A later, sequential check opens a fresh round and recomputes from source
+    # rather than borrowing the prior round's (or production's) stages.
+    follow_status, follow = client.request(
+        "POST",
+        f"/v1/renditions/{rendition_a['id']}/integrity-checks",
+        {},
+    )
+    require_equal(follow_status, 201, "sequential follow-up check status")
+    require_equal(follow["status"], "verified", "sequential follow-up result")
+    after = server.application.metrics_snapshot()
+    require(
+        after["production"]["reused"] > 0,
+        "production reuse remains observable",
+    )
+
+    metrics_status, metrics = client.request("GET", "/v1/metrics")
+    require_equal(metrics_status, 200, "metrics status")
+    require(
+        "production" in metrics and "by_stage" in metrics["production"],
+        "metrics expose per-stage execution counts",
+    )
+    return {
+        "workflow": "shared-stage-reuse",
+        "production_reused": snapshot["production"]["reused"],
+        "production_computed": snapshot["production"]["computed"],
+        "parallel_verified": all(
+            body["status"] == "verified" for _, body in results.values()
+        ),
+        "distinct_mix_outputs": True,
+        "metrics_endpoint": metrics_status == 200,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -401,6 +563,7 @@ def main() -> int:
             "ingest-media-asset",
             "execute-rendition",
             "verify-reproduction",
+            "shared-stage-reuse",
         ),
     )
     args = parser.parse_args()
@@ -410,8 +573,10 @@ def main() -> int:
             result = run_ingest_media_asset(client)
         elif args.workflow == "execute-rendition":
             result = run_execute_rendition(client)
-        else:
+        elif args.workflow == "verify-reproduction":
             result = run_verify_reproduction(client, server)
+        else:
+            result = run_shared_stage_reuse(client, server)
     print(json.dumps(result, sort_keys=True))
     return 0
 

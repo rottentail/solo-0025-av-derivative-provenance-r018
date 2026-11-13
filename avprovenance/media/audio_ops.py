@@ -5,7 +5,10 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from ..serialization import sha256_hex
 from .errors import MediaOperationFailure
+from .stage_cache import StageCache
+from .stage_keys import decode_key, stage_key
 from .wav import AudioClip, decode_wav, encode_wav, replace_channels
 
 
@@ -106,46 +109,118 @@ def mix_audio(
     return replace_channels(primary, mixed)
 
 
-def render_audio(
-    primary_bytes: bytes,
-    operations: list[dict[str, Any]],
-    secondary_bytes: bytes | None,
-) -> bytes:
-    clip = decode_wav(primary_bytes)
-    secondary = decode_wav(secondary_bytes) if secondary_bytes is not None else None
-    mixed = False
-
+def _apply_audio_operation(
+    clip: AudioClip,
+    operation: dict[str, Any],
+    secondary: AudioClip | None,
+) -> AudioClip:
+    """Apply one normalized operation, preserving prior error semantics."""
     try:
-        for operation in operations:
-            operation_type = operation["type"]
-            if operation_type == "media_trim":
-                clip = trim_audio(clip, operation)
-            elif operation_type == "audio_gain":
-                clip = gain_audio(clip, operation)
-            elif operation_type == "audio_normalize":
-                clip = normalize_audio(clip, operation)
-            elif operation_type == "audio_mix":
-                if secondary is None:
-                    raise MediaOperationFailure(
-                        "AUDIO_MIX_SOURCE_MISSING",
-                        "audio_mix requires a secondary media asset.",
-                    )
-                if mixed:
-                    raise MediaOperationFailure(
-                        "AUDIO_MIX_DUPLICATE",
-                        "An audio plan may mix the secondary source only once.",
-                    )
-                clip = mix_audio(clip, secondary, operation)
-                mixed = True
-            else:
+        operation_type = operation["type"]
+        if operation_type == "media_trim":
+            return trim_audio(clip, operation)
+        if operation_type == "audio_gain":
+            return gain_audio(clip, operation)
+        if operation_type == "audio_normalize":
+            return normalize_audio(clip, operation)
+        if operation_type == "audio_mix":
+            if secondary is None:
                 raise MediaOperationFailure(
-                    "UNSUPPORTED_AUDIO_OPERATION",
-                    f"Unsupported audio operation: {operation_type}",
+                    "AUDIO_MIX_SOURCE_MISSING",
+                    "audio_mix requires a secondary media asset.",
                 )
+            return mix_audio(clip, secondary, operation)
+        raise MediaOperationFailure(
+            "UNSUPPORTED_AUDIO_OPERATION",
+            f"Unsupported audio operation: {operation_type}",
+        )
     except (KeyError, TypeError, ValueError) as exc:
         raise MediaOperationFailure(
             "AUDIO_OPERATION_INVALID",
             "The audio operation payload is malformed.",
         ) from exc
 
+
+def render_audio_staged(
+    primary_bytes: bytes,
+    operations: list[dict[str, Any]],
+    secondary_bytes: bytes | None,
+    *,
+    primary_digest: str,
+    secondary_digest: str | None,
+    cache: StageCache,
+) -> bytes:
+    """Render while reusing every shared, fully computed intermediate stage."""
+    clip = cache.get_or_compute(
+        decode_key(role="primary", source_digest=primary_digest),
+        "decode_primary",
+        lambda: decode_wav(primary_bytes),
+    )
+
+    secondary: AudioClip | None = None
+    if secondary_bytes is not None:
+        if secondary_digest is None:
+            secondary_digest = sha256_hex(secondary_bytes)
+        secondary = cache.get_or_compute(
+            decode_key(role="secondary", source_digest=secondary_digest),
+            "decode_secondary",
+            lambda: decode_wav(secondary_bytes),
+        )
+
+    mixed = False
+    # The secondary only contributes after the single allowed mix operation.
+    active_secondary_digest: str | None = None
+    for index, operation in enumerate(operations):
+        if operation["type"] == "audio_mix":
+            if secondary is None:
+                raise MediaOperationFailure(
+                    "AUDIO_MIX_SOURCE_MISSING",
+                    "audio_mix requires a secondary media asset.",
+                )
+            if mixed:
+                raise MediaOperationFailure(
+                    "AUDIO_MIX_DUPLICATE",
+                    "An audio plan may mix the secondary source only once.",
+                )
+            mixed = True
+            active_secondary_digest = secondary_digest
+
+        prefix = operations[: index + 1]
+        key = stage_key(
+            stage="audio",
+            primary_digest=primary_digest,
+            secondary_digest=active_secondary_digest,
+            operations_prefix=prefix,
+        )
+        current_clip = clip
+        current_secondary = secondary
+        clip = cache.get_or_compute(
+            key,
+            f"audio:{operation['type']}",
+            lambda: _apply_audio_operation(
+                current_clip, operation, current_secondary
+            ),
+        )
+
     return encode_wav(clip)
+
+
+def render_audio(
+    primary_bytes: bytes,
+    operations: list[dict[str, Any]],
+    secondary_bytes: bytes | None,
+) -> bytes:
+    """Backward-compatible entry point using a private, request-local cache."""
+    cache = StageCache(scope="standalone-audio")
+    primary_digest = sha256_hex(primary_bytes)
+    secondary_digest = (
+        sha256_hex(secondary_bytes) if secondary_bytes is not None else None
+    )
+    return render_audio_staged(
+        primary_bytes,
+        operations,
+        secondary_bytes,
+        primary_digest=primary_digest,
+        secondary_digest=secondary_digest,
+        cache=cache,
+    )

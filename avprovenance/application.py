@@ -17,12 +17,13 @@ from .models import (
     ProvenanceEdge,
     Rendition,
 )
-from .media import inspect_media
+from .media import MetricsRegistry, StageCache, inspect_media
 from .renditions import (
     compile_plan,
     execute_plan,
     reproduce_output,
 )
+from .verification import VerificationRoundManager
 from .serialization import (
     deep_copy,
     new_identifier,
@@ -48,6 +49,15 @@ class MediaProvenanceApplication:
         self.content_files = ContentFileRepository(self.data_dir / "content")
         self.state_file = JsonStateFile(self.data_dir / "state.json")
         self.repository = ProvenanceRepository(self.state_file)
+        # Process-wide shared stage cache for production rendering.  It is
+        # content-addressed, so distinct sources or parameters never collide.
+        self.metrics_registry = MetricsRegistry()
+        self.production_cache = StageCache(
+            scope="production",
+            metrics=self.metrics_registry.production,
+        )
+        # Verification gets its own round-scoped caches, never this one.
+        self.verification_rounds = VerificationRoundManager(self.metrics_registry)
 
     def _asset_bytes(self, asset: MediaAsset) -> bytes:
         return self.content_files.read(asset.content_key)
@@ -159,6 +169,9 @@ class MediaProvenanceApplication:
                 primary_bytes,
                 plan.operations,
                 secondary_bytes,
+                cache=self.production_cache,
+                primary_digest=primary.sha256,
+                secondary_digest=secondary.sha256 if secondary else None,
             )
             output_digest = sha256_hex(outcome.data)
             output_key = self.content_files.key_for_digest(output_digest)
@@ -324,13 +337,15 @@ class MediaProvenanceApplication:
                 expected_descriptor=expected_descriptor,
             )
 
-        outcome = reproduce_output(
-            output_asset=output_asset,
-            recorded_output_bytes=recorded_output,
-            primary_bytes=primary_bytes,
-            operations=deep_copy(rendition.operations),
-            secondary_bytes=secondary_bytes,
-        )
+        with self.verification_rounds.round_cache() as verification_cache:
+            outcome = reproduce_output(
+                output_asset=output_asset,
+                recorded_output_bytes=recorded_output,
+                primary_bytes=primary_bytes,
+                operations=deep_copy(rendition.operations),
+                secondary_bytes=secondary_bytes,
+                cache=verification_cache,
+            )
         finished = self.repository.settle_integrity_audit(
             audit.id,
             status=outcome.status,
@@ -349,6 +364,9 @@ class MediaProvenanceApplication:
                 "reason": finished.reason,
             },
         )
+
+    def metrics_snapshot(self) -> dict[str, Any]:
+        return self.metrics_registry.snapshot()
 
     def close(self) -> None:
         return
